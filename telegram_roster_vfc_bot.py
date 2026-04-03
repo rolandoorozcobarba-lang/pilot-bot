@@ -606,4 +606,326 @@ def next_day_sleep_plan(tomorrow_assignment: Optional[Dict[str, Any]]) -> Option
 
 
 def build_time_blocking(today_assignment: Optional[Dict[str, Any]], sleep_plan: Optional[Dict[str, str]], fatigue_lvl: str) -> List[str]:
-    blo
+    blocks = []
+
+    if sleep_plan:
+        blocks.append(f"Despertar mañana: {sleep_plan['wake_time']}")
+        blocks.append(f"Dormir hoy idealmente: {sleep_plan['sleep_time']}")
+
+    if today_assignment and today_assignment.get("check_in"):
+        ci = today_assignment["check_in"]
+        ci_min = hhmm_to_minutes(ci)
+        blocks.append(f"Pre-duty: {minutes_to_hhmm(ci_min - 60)} snack ligero / hidratación")
+        blocks.append(f"Check-in: {ci}")
+        blocks.append(f"Post primer bloque: {minutes_to_hhmm(ci_min + 180)} proteína + carbs moderados")
+        blocks.append(f"Mitad del día: {minutes_to_hhmm(ci_min + 300)} snack ligero")
+        blocks.append("Cena: ligera y fácil de digerir")
+    else:
+        if fatigue_lvl in ("🔴 HIGH", "🔥 CRITICAL"):
+            blocks.extend([
+                "Desayuno: proteína + grasa ligera",
+                "Comida: proteína + verduras + carbs moderados",
+                "Snack: fruta + proteína",
+                "Cena: ligera",
+            ])
+        else:
+            blocks.extend([
+                "Desayuno: completo y limpio",
+                "Comida: balanceada",
+                "Snack: ligero",
+                "Cena: ligera",
+            ])
+
+    return blocks
+
+
+# =========================
+# OPENAI / FALLBACK
+# =========================
+def generate_ai_plan(payload: Dict[str, Any]) -> str:
+    quotes = get_daily_quotes(payload["date"])
+
+    if not client:
+        return generate_fallback_plan(payload, quotes)
+
+    system_prompt = """
+Eres un coach elite de rendimiento para pilotos y experto en FRMS tipo AIMS.
+
+Tu salida debe:
+- sonar humana, clara y útil
+- priorizar lo importante
+- interpretar el estado del día
+- integrar el roster de hoy y de mañana si existe
+- explicar el riesgo FRMS (LOW/MODERATE/HIGH/CRITICAL)
+- dar una decisión clave del día
+- incluir un time blocking práctico
+- considerar la hora ideal de dormir hoy para cumplir 8h antes del siguiente duty
+
+No uses checklist robotizado.
+No inventes datos del roster.
+Si no hay asignación en un día, no la menciones.
+Cierra con:
+🪶 frase estoica
+📖 frase inspirada en sabiduría
+"""
+
+    user_prompt = f"""
+Analiza este contexto y genera un briefing personal del día:
+
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+
+Que se sienta como un coach elite que habla con un piloto profesional.
+Usa estas frases al final:
+Estoica: {quotes['stoic']}
+Sabiduría: {quotes['wisdom']}
+"""
+
+    try:
+        res = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.9,
+        )
+        return res.choices[0].message.content.strip()
+    except Exception:
+        return generate_fallback_plan(payload, quotes)
+
+
+def generate_fallback_plan(payload: Dict[str, Any], quotes: Dict[str, str]) -> str:
+    parts = []
+    parts.append(f"Fecha: {payload['date']}")
+    parts.append(f"Estado operativo: {payload['fatigue_level']}")
+    parts.append(f"Fatigue score: {payload['fatigue_score']}")
+    parts.append(f"Tendencia: {payload['trend']}")
+    parts.append("")
+
+    if payload.get("today_assignment"):
+        ta = payload["today_assignment"]
+        parts.append("Hoy sí tienes asignación.")
+        if ta.get("route"):
+            parts.append(f"Ruta: {ta['route']}")
+        if ta.get("check_in"):
+            parts.append(f"Check-in: {ta['check_in']}")
+        parts.append(f"Block total hoy: {ta['total_hours']} h")
+        parts.append("")
+
+    if payload.get("tomorrow_assignment"):
+        tm = payload["tomorrow_assignment"]
+        parts.append("Mañana también tienes asignación.")
+        if tm.get("route"):
+            parts.append(f"Ruta mañana: {tm['route']}")
+        if tm.get("check_in"):
+            parts.append(f"Check-in mañana: {tm['check_in']}")
+        if payload.get("sleep_plan"):
+            parts.append(f"Para cumplir 8h, hoy deberías dormir cerca de {payload['sleep_plan']['sleep_time']}.")
+        parts.append("")
+
+    parts.append("Time blocking sugerido:")
+    for b in payload["time_blocking"]:
+        parts.append(f"- {b}")
+    parts.append("")
+    parts.append(f"🪶 {quotes['stoic']}")
+    parts.append(f"📖 {quotes['wisdom']}")
+    return "\n".join(parts)
+
+
+# =========================
+# COMMANDS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Bot listo ✅\n\n"
+        "1. Súbeme tu roster PDF\n"
+        "2. Usa /plan cada día\n"
+        "3. Yo conservaré el roster hasta que subas uno nuevo"
+    )
+
+
+async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = user_key(update)
+
+    tg_file = await context.bot.get_file(update.message.document.file_id)
+    pdf_bytes = await tg_file.download_as_bytearray()
+
+    text = extract_pdf_text(pdf_bytes)
+    parsed = parse_roster_table(text)
+    summary = roster_summary(parsed)
+
+    USER_DATA.setdefault(u, {})
+    USER_DATA[u]["roster_parsed"] = parsed
+    USER_DATA[u]["roster_summary"] = summary
+    USER_DATA[u]["conversation_state"] = None
+    USER_DATA[u].setdefault("metrics_by_day", {})
+    save_data()
+
+    heavy = summary["heavy_calendar_days"]
+    heavy_text = "\n".join([f"- {x['date']} ({x['hours']}h)" for x in heavy[:5]]) if heavy else "Ninguno"
+
+    top3 = summary["top3_calendar"]
+    top3_text = "\n".join([f"- {x['date']} ({x['hours']}h)" for x in top3]) if top3 else "Ninguno"
+
+    alerts_text = "\n".join(summary["alerts_30_in_7"]) if summary["alerts_30_in_7"] else "Sin riesgo"
+
+    visible_period = "N/D"
+    if summary["visible_start"] and summary["visible_end"]:
+        visible_period = f"{summary['visible_start']} → {summary['visible_end']}"
+
+    msg = (
+        "Roster cargado ✅\n\n"
+        f"Periodo visible: {visible_period}\n"
+        f"Horas roster (incluye pasivos): {summary['total_roster_hours']}h\n"
+        f"Horas activas: {summary['total_active_hours']}h\n"
+        f"Horas pasivas: {summary['total_passive_hours']}h\n"
+        f"Días con vuelo activo: {summary['days_with_active_flight']}\n\n"
+        f"Días pesados (>6h calendario):\n{heavy_text}\n\n"
+        f"Top 3 días con más block:\n{top3_text}\n\n"
+        f"Alertas 30h / 7 días:\n{alerts_text}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = user_key(update)
+    USER_DATA.setdefault(u, {})
+
+    if "roster_parsed" not in USER_DATA[u]:
+        await update.message.reply_text("Primero súbeme tu roster PDF.")
+        return
+
+    USER_DATA[u]["conversation_state"] = "awaiting_vfc"
+    USER_DATA[u]["pending_plan"] = {"date": today_local_str()}
+    save_data()
+
+    await update.message.reply_text("Buen día. ¿Cuál fue tu VFC de 7 días?")
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = user_key(update)
+    metrics = USER_DATA.get(u, {}).get("metrics_by_day", {})
+    if not metrics:
+        await update.message.reply_text("No tengo métricas guardadas todavía.")
+        return
+
+    dates = sorted(metrics.keys())[-7:]
+    lines = ["Últimas métricas:"]
+    for d in dates:
+        m = metrics[d]
+        lines.append(f"{d} → VFC {m['vfc']} | Sueño {m['sleep_hhmm']} | Score {m['score']}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# =========================
+# CAPTURE FLOW
+# =========================
+async def capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = user_key(update)
+    state = USER_DATA.get(u, {}).get("conversation_state")
+    if not state:
+        return
+
+    text = update.message.text.strip()
+
+    if state == "awaiting_vfc":
+        try:
+            vfc = int(text)
+        except ValueError:
+            await update.message.reply_text("Pásame solo el número de VFC. Ejemplo: 50")
+            return
+
+        USER_DATA[u]["pending_plan"]["vfc"] = vfc
+        USER_DATA[u]["conversation_state"] = "awaiting_sleep"
+        save_data()
+        await update.message.reply_text("¿Cuánto dormiste? Escríbelo en hh:mm, por ejemplo 04:05")
+        return
+
+    if state == "awaiting_sleep":
+        if not re.fullmatch(r"\d{1,2}:\d{2}", text):
+            await update.message.reply_text("Formato inválido. Usa hh:mm, por ejemplo 04:05")
+            return
+
+        USER_DATA[u]["pending_plan"]["sleep_hhmm"] = text
+        USER_DATA[u]["pending_plan"]["sleep_hours"] = hhmm_to_hours(text)
+        USER_DATA[u]["conversation_state"] = "awaiting_score"
+        save_data()
+        await update.message.reply_text("¿Cuál fue tu score de sueño?")
+        return
+
+    if state == "awaiting_score":
+        try:
+            score = int(text)
+        except ValueError:
+            await update.message.reply_text("Pásame solo el número del score. Ejemplo: 53")
+            return
+
+        pending = USER_DATA[u]["pending_plan"]
+        pending["score"] = score
+
+        USER_DATA[u].setdefault("metrics_by_day", {})
+        USER_DATA[u]["metrics_by_day"][pending["date"]] = {
+            "vfc": pending["vfc"],
+            "sleep_hhmm": pending["sleep_hhmm"],
+            "sleep_hours": pending["sleep_hours"],
+            "score": pending["score"],
+            "saved_at": now_local().isoformat(),
+        }
+
+        parsed = USER_DATA[u]["roster_parsed"]
+        today_assignment = find_day_assignment(parsed, pending["date"])
+        tomorrow_assignment = find_day_assignment(parsed, tomorrow_local_str())
+
+        tr = analyze_trend(USER_DATA[u])
+        tomorrow_checkin = tomorrow_assignment["check_in"] if tomorrow_assignment else None
+        wocl = wocl_risk(tomorrow_checkin)
+        score_num = fatigue_score(pending["vfc"], pending["sleep_hours"], tr, wocl)
+        lvl = fatigue_level(score_num)
+        sleep_plan = next_day_sleep_plan(tomorrow_assignment)
+        time_blocks = build_time_blocking(today_assignment, sleep_plan, lvl)
+
+        payload = {
+            "date": pending["date"],
+            "vfc": pending["vfc"],
+            "sleep_hhmm": pending["sleep_hhmm"],
+            "sleep_hours": pending["sleep_hours"],
+            "sleep_score": pending["score"],
+            "trend": tr,
+            "wocl_tomorrow": wocl,
+            "fatigue_score": score_num,
+            "fatigue_level": lvl,
+            "today_assignment": today_assignment,
+            "tomorrow_assignment": tomorrow_assignment,
+            "sleep_plan": sleep_plan,
+            "time_blocking": time_blocks,
+            "roster_summary": USER_DATA[u]["roster_summary"],
+        }
+
+        plan_text = generate_ai_plan(payload)
+        plan_text += "\n\n💾 Métricas guardadas para esta fecha."
+
+        USER_DATA[u]["conversation_state"] = None
+        USER_DATA[u].pop("pending_plan", None)
+        save_data()
+
+        await update.message.reply_text(plan_text)
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    load_data()
+    app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("plan", plan))
+    app.add_handler(CommandHandler("history", history))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture))
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
