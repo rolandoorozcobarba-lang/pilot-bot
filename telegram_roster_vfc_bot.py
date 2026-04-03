@@ -651,33 +651,59 @@ def generate_ai_plan(payload: Dict[str, Any]) -> str:
     system_prompt = """
 Eres un coach elite de rendimiento para pilotos y experto en FRMS tipo AIMS.
 
-Tu salida debe:
-- sonar humana, clara y útil
-- priorizar lo importante
-- interpretar el estado del día
-- integrar el roster de hoy y de mañana si existe
-- explicar el riesgo FRMS (LOW/MODERATE/HIGH/CRITICAL)
-- dar una decisión clave del día
-- incluir un time blocking práctico
-- considerar la hora ideal de dormir hoy para cumplir 8h antes del siguiente duty
+Tu respuesta debe sentirse como un briefing personal, humano, claro y ejecutivo.
+No hables como reporte técnico largo ni como checklist robotizado.
 
-No uses checklist robotizado.
-No inventes datos del roster.
-Si no hay asignación en un día, no la menciones.
-Cierra con:
+OBJETIVO:
+Ayudar al piloto a entender rápidamente cómo está hoy, qué significa eso para mañana
+y cuál es la mejor decisión del día.
+
+ESTRUCTURA OBLIGATORIA:
+1. Resumen de hoy
+2. Fatiga y WOCL
+3. Lo más importante
+4. Movimiento recomendado hoy
+5. Plan práctico del día
+6. Asignación de mañana (solo si aplica)
+7. Cierre
+8. Frases finales
+
+REGLAS:
+- Mantén visibles los datos de FATIGA y WOCL.
+- Explícalos en lenguaje humano, no solo técnico.
+- Incluye siempre una sección llamada “Movimiento recomendado hoy”.
+- Debes recomendar una de estas opciones:
+  - recovery total
+  - caminata + movilidad
+  - fuerza ligera/moderada
+  - HIIT / sesión fuerte
+- Si mañana hay check-in temprano o WOCL crítico, evita recomendar entrenamiento intenso.
+- Si no hay asignación mañana, no la menciones.
+- No inventes datos del roster.
+- No satures con demasiadas recomendaciones; prioriza lo importante.
+- El tono debe ser sobrio, útil y profesional.
+
+CIERRE:
+Termina siempre con:
 🪶 frase estoica
 📖 frase inspirada en sabiduría
 """
 
     user_prompt = f"""
-Analiza este contexto y genera un briefing personal del día:
+Analiza este contexto y genera el briefing del día:
 
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 
-Que se sienta como un coach elite que habla con un piloto profesional.
-Usa estas frases al final:
-Estoica: {quotes['stoic']}
-Sabiduría: {quotes['wisdom']}
+Quiero una respuesta:
+- breve pero útil
+- más amigable
+- más humana
+- más ejecutiva
+
+IMPORTANTE:
+- deja explícitos los datos de fatiga y WOCL
+- agrega una recomendación concreta de movimiento/ejercicio para hoy
+- si mañana hay asignación, úsala para definir el tono del día y la hora ideal de dormir
 """
 
     try:
@@ -687,51 +713,72 @@ Sabiduría: {quotes['wisdom']}
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.9,
+            temperature=0.85,
         )
         return res.choices[0].message.content.strip()
     except Exception:
         return generate_fallback_plan(payload, quotes)
 
 
-def generate_fallback_plan(payload: Dict[str, Any], quotes: Dict[str, str]) -> str:
+ def generate_fallback_plan(payload: Dict[str, Any], quotes: Dict[str, str]) -> str:
     parts = []
-    parts.append(f"Fecha: {payload['date']}")
-    parts.append(f"Estado operativo: {payload['fatigue_level']}")
-    parts.append(f"Fatigue score: {payload['fatigue_score']}")
-    parts.append(f"Tendencia: {payload['trend']}")
+
+    parts.append("Resumen de hoy")
+    parts.append(
+        f"Hoy estás en {payload['fatigue_level']}. "
+        f"La combinación entre sueño, VFC y contexto operativo marca el tono del día."
+    )
     parts.append("")
 
-    if payload.get("today_assignment"):
-        ta = payload["today_assignment"]
-        parts.append("Hoy sí tienes asignación.")
-        if ta.get("route"):
-            parts.append(f"Ruta: {ta['route']}")
-        if ta.get("check_in"):
-            parts.append(f"Check-in: {ta['check_in']}")
-        parts.append(f"Block total hoy: {ta['total_hours']} h")
-        parts.append("")
+    parts.append("Fatiga y WOCL")
+    parts.append(f"- Fatiga: {payload['fatigue_score']} / {payload['fatigue_level']}")
+    parts.append(f"- WOCL mañana: {payload['wocl_tomorrow']}")
+    parts.append("")
 
-    if payload.get("tomorrow_assignment"):
-        tm = payload["tomorrow_assignment"]
-        parts.append("Mañana también tienes asignación.")
-        if tm.get("route"):
-            parts.append(f"Ruta mañana: {tm['route']}")
-        if tm.get("check_in"):
-            parts.append(f"Check-in mañana: {tm['check_in']}")
-        if payload.get("sleep_plan"):
-            parts.append(f"Para cumplir 8h, hoy deberías dormir cerca de {payload['sleep_plan']['sleep_time']}.")
-        parts.append("")
+    parts.append("Lo más importante")
+    if payload.get("sleep_plan"):
+        parts.append(
+            f"Tu prioridad hoy es proteger el descanso para poder dormir cerca de "
+            f"{payload['sleep_plan']['sleep_time']}."
+        )
+    else:
+        parts.append("Tu prioridad hoy es conservar energía y no añadir fatiga innecesaria.")
+    parts.append("")
 
-    parts.append("Time blocking sugerido:")
+    parts.append("Movimiento recomendado hoy")
+    if payload["fatigue_level"] in ("🔴 HIGH", "🔥 CRITICAL") or payload["wocl_tomorrow"] in ("MODERATE", "CRITICAL"):
+        parts.append("- Caminata suave 20–30 min")
+        parts.append("- Movilidad 10–15 min")
+        parts.append("- Evitar HIIT o fuerza pesada")
+    elif payload["fatigue_level"] == "🟡 MODERATE":
+        parts.append("- Fuerza ligera o moderada")
+        parts.append("- Caminata")
+        parts.append("- Core o movilidad")
+    else:
+        parts.append("- Buen día para entrenar fuerte si el contexto lo permite")
+    parts.append("")
+
+    parts.append("Plan práctico del día")
     for b in payload["time_blocking"]:
         parts.append(f"- {b}")
     parts.append("")
+
+    if payload.get("tomorrow_assignment"):
+        tm = payload["tomorrow_assignment"]
+        parts.append("Asignación de mañana")
+        if tm.get("route"):
+            parts.append(f"- Ruta: {tm['route']}")
+        if tm.get("check_in"):
+            parts.append(f"- Check-in: {tm['check_in']}")
+        parts.append("")
+
+    parts.append("Cierre")
+    parts.append("Hoy no toca exprimir el día; toca prepararte bien para rendir mañana.")
+    parts.append("")
     parts.append(f"🪶 {quotes['stoic']}")
     parts.append(f"📖 {quotes['wisdom']}")
+
     return "\n".join(parts)
-
-
 # =========================
 # COMMANDS
 # =========================
