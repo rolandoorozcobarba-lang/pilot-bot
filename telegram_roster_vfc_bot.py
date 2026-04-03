@@ -782,6 +782,14 @@ def generate_fallback_plan(payload: Dict[str, Any], quotes: Dict[str, str]) -> s
 # =========================
 # CAPTURE FLOW
 # =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✈️ Sistema listo\n\n"
+        "Flujo recomendado:\n"
+        "1. Sube tu roster PDF\n"
+        "2. Ejecuta /plan cada día\n\n"
+        "Yo me encargo del resto 🧠"
+    )
 async def capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = user_key(update)
     state = USER_DATA.get(u, {}).get("conversation_state")
