@@ -15,14 +15,11 @@ from openai import OpenAI
 # =========================
 # CONFIG
 # =========================
-DATA_FILE = "user_metrics.json"
+DATA_FILE = "data.json"
 USER_DATA = {}
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 
 # =========================
 # UTILS
@@ -34,9 +31,15 @@ def today():
     return now().strftime("%Y-%m-%d")
 
 def hhmm_to_hours(h):
-    h, m = map(int, h.split(":"))
+    h,m = map(int,h.split(":"))
     return h + m/60
 
+def extract_times(text):
+    return re.findall(r"\d{2}:\d{2}", text)
+
+def extract_time(text):
+    t = extract_times(text)
+    return t[0] if t else None
 
 # =========================
 # STORAGE
@@ -47,245 +50,272 @@ def load():
         USER_DATA = json.load(open(DATA_FILE))
 
 def save():
-    json.dump(USER_DATA, open(DATA_FILE, "w"), indent=2)
-
+    json.dump(USER_DATA, open(DATA_FILE,"w"), indent=2)
 
 # =========================
 # ROSTER
 # =========================
 def parse_roster(text):
-    data = {}
+    roster = {}
+    current = None
+
     for line in text.split("\n"):
-        if re.match(r"(JAN|FEB|MAR|APR)", line):
+        if re.match(r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)", line):
             parts = line.split()
-            date = f"{parts[0]} {parts[1]}"
-            data[date] = {"raw": line}
-    return data
+            current = f"{parts[0]} {parts[1]}"
+            roster[current] = {"flights":[]}
+
+        elif current and "Y4" in line:
+            roster[current]["flights"].append(line)
+
+    return roster
 
 def key_today():
     return now().strftime("%b %d").upper()
 
 def key_tomorrow():
-    return (now() + timedelta(days=1)).strftime("%b %d").upper()
-
-def extract_time(text):
-    if not text:
-        return None
-    m = re.search(r"(\d{2}:\d{2})", text)
-    return m.group(1) if m else None
-
+    return (now()+timedelta(days=1)).strftime("%b %d").upper()
 
 # =========================
-# FRMS (tipo AIMS simplificado)
+# HORAS
 # =========================
-def frms_level(vfc, sleep, checkin):
-    if sleep < 4:
-        return "🔥 CRITICAL"
-    if sleep < 5 or vfc < 47:
-        return "🔴 HIGH"
-    if sleep < 6:
-        return "🟡 MODERATE"
-    return "🟢 LOW"
+def calc_hours(flights):
+    total=0
+    for f in flights:
+        t=extract_times(f)
+        if len(t)>=2:
+            h1,m1=map(int,t[-2].split(":"))
+            h2,m2=map(int,t[-1].split(":"))
 
+            t1=h1*60+m1
+            t2=h2*60+m2
+            total += (t2-t1)%1440
+    return total/60
+
+# =========================
+# ANALISIS ROSTER
+# =========================
+def roster_analysis(roster):
+    days=[]
+    for d,info in roster.items():
+        h=calc_hours(info["flights"])
+        days.append((d,h))
+
+    total=sum(h for _,h in days)
+
+    alerts=[]
+    heavy=[d for d,h in days if h>7]
+
+    for i in range(len(days)):
+        w=days[i:i+7]
+        if len(w)<7: continue
+
+        h=sum(x[1] for x in w)
+
+        if h>30:
+            alerts.append(f"🔥 Exceso {w[0][0]}→{w[-1][0]} ({round(h,1)}h)")
+        elif h>27:
+            alerts.append(f"⚠️ Límite {w[0][0]}→{w[-1][0]} ({round(h,1)}h)")
+
+    return {
+        "total":round(total,1),
+        "heavy":heavy,
+        "alerts":alerts
+    }
 
 # =========================
 # FATIGA
 # =========================
-def analyze_trend(user):
-    metrics = user.get("metrics_by_day", {})
-    dates = sorted(metrics.keys())[-7:]
+def trend(user):
+    m=user.get("metrics",{})
+    d=sorted(m.keys())[-7:]
 
-    if len(dates) < 3:
-        return "sin datos"
+    if len(d)<3: return "sin datos"
 
-    vfc = [metrics[d]["vfc"] for d in dates]
-    sleep = [metrics[d]["sleep_hours"] for d in dates]
+    v=[m[x]["vfc"] for x in d]
+    s=[m[x]["sleep"] for x in d]
 
-    if vfc[-1] < vfc[0] - 3:
-        return "fatiga creciente"
-
-    if sum(sleep)/len(sleep) < 6:
-        return "deuda de sueño"
+    if v[-1]<v[0]-3: return "fatiga creciente"
+    if sum(s)/len(s)<6: return "deuda sueño"
 
     return "estable"
 
+def wocl(checkin):
+    if not checkin: return "LOW"
+    h=int(checkin.split(":")[0])
+
+    if 2<=h<6: return "CRITICAL"
+    if h<8: return "MODERATE"
+    return "LOW"
+
+def fatigue_score(vfc,sleep,trend,w):
+    score=100
+
+    if sleep<5: score-=40
+    elif sleep<6: score-=25
+    elif sleep<7: score-=10
+
+    if vfc<48: score-=20
+    elif vfc<50: score-=10
+
+    if trend=="fatiga creciente": score-=15
+
+    if w=="CRITICAL": score-=25
+    elif w=="MODERATE": score-=10
+
+    return max(score,0)
+
+def level(score):
+    if score<40: return "🔥 CRITICAL"
+    if score<60: return "🔴 HIGH"
+    if score<80: return "🟡 MODERATE"
+    return "🟢 LOW"
 
 # =========================
 # SLEEP PLAN
 # =========================
-def sleep_plan(next_assignment):
-    if not next_assignment:
-        return None
+def sleep_plan(next):
+    if not next: return None
 
-    t = extract_time(next_assignment.get("raw"))
-    if not t:
-        return None
+    t=extract_time(next.get("raw",""))
+    if not t: return None
 
-    h, m = map(int, t.split(":"))
-    checkin = h * 60 + m
+    h,m=map(int,t.split(":"))
+    c=h*60+m
 
-    wake = checkin - 120
-    sleep = wake - (8 * 60)
+    wake=c-120
+    sleep=wake-(8*60)
 
     return {
-        "checkin": t,
-        "wake": f"{wake//60:02d}:{wake%60:02d}",
-        "sleep": f"{sleep//60:02d}:{sleep%60:02d}"
+        "checkin":t,
+        "wake":f"{wake//60:02d}:{wake%60:02d}",
+        "sleep":f"{sleep//60:02d}:{sleep%60:02d}"
     }
-
-
-# =========================
-# TIME BLOCKING
-# =========================
-def build_timeblock(sleep_data):
-    if not sleep_data:
-        return "Día libre → entrena normal y duerme 7-8h"
-
-    return f"""
-Wake: {sleep_data['wake']}
-Comida 1: 60-90 min después
-Entrenamiento: ligero o movilidad
-Comida 2: media jornada
-Siesta: 20 min (si aplica)
-Cena: 3h antes de dormir
-Sleep: {sleep_data['sleep']}
-"""
-
 
 # =========================
 # IA
 # =========================
-def generate_ai(payload):
+def ai(payload):
+    system="""
+Eres coach elite + FRMS tipo AIMS.
 
-    system = """
-Eres un coach de rendimiento de élite para pilotos.
+Haz briefing personal:
+- estado
+- riesgo
+- impacto operativo
+- decisión clave
+- time blocking
+- sueño para mañana
 
-Analiza como experto en FRMS tipo AIMS.
-
-Incluye:
-1. Estado del día
-2. Impacto en desempeño
-3. Análisis de asignación (si existe)
-4. Nivel de riesgo FRMS
-5. Decisión del día (clave)
-6. Time blocking claro
-7. Estrategia de descanso para mañana
-
-No uses formato rígido.
-Habla humano, claro y directo.
+Habla humano, no robot.
 """
 
-    user = f"""
-Analiza este contexto:
-
-{json.dumps(payload, indent=2)}
-
-Genera un plan completo tipo coach elite.
+    user=f"""
+{json.dumps(payload,indent=2)}
 """
 
-    try:
-        res = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user}
-            ],
-            temperature=0.9
-        )
-        return res.choices[0].message.content
+    r=client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role":"system","content":system},
+                  {"role":"user","content":user}],
+        temperature=0.9
+    )
 
-    except Exception as e:
-        return f"ERROR IA: {e}"
-
+    return r.choices[0].message.content
 
 # =========================
-# TELEGRAM FLOW
+# TELEGRAM
 # =========================
-async def start(update, context):
-    await update.message.reply_text("Bot listo ✈️ usa /plan")
+async def pdf(update,context):
+    u=str(update.effective_user.id)
 
+    f=await context.bot.get_file(update.message.document.file_id)
+    b=await f.download_as_bytearray()
 
-async def handle_pdf(update, context):
-    user = str(update.effective_user.id)
+    t=""
+    for p in PdfReader(io.BytesIO(b)).pages:
+        t+=p.extract_text() or ""
 
-    file = await context.bot.get_file(update.message.document.file_id)
-    pdf = await file.download_as_bytearray()
+    r=parse_roster(t)
+    a=roster_analysis(r)
 
-    text = ""
-    reader = PdfReader(io.BytesIO(pdf))
-    for p in reader.pages:
-        text += p.extract_text() or ""
-
-    USER_DATA.setdefault(user, {})
-    USER_DATA[user]["roster"] = parse_roster(text)
-
-    save()
-    await update.message.reply_text("Roster cargado ✅")
-
-
-async def plan(update, context):
-    user = str(update.effective_user.id)
-
-    USER_DATA.setdefault(user, {})
-    USER_DATA[user]["state"] = "vfc"
-    USER_DATA[user]["temp"] = {"date": today()}
+    USER_DATA.setdefault(u,{})
+    USER_DATA[u]["roster"]=r
+    USER_DATA[u]["analysis"]=a
 
     save()
+
+    await update.message.reply_text(f"""
+Roster cargado ✅
+
+✈️ {a['total']}h
+⚠️ {len(a['heavy'])} días pesados
+🚨 {len(a['alerts'])} alertas
+""")
+
+async def plan(update,context):
+    u=str(update.effective_user.id)
+    USER_DATA.setdefault(u,{})
+
+    USER_DATA[u]["state"]="vfc"
+    USER_DATA[u]["temp"]={"date":today()}
+
     await update.message.reply_text("VFC?")
 
+async def capture(update,context):
+    u=str(update.effective_user.id)
+    s=USER_DATA.get(u,{}).get("state")
 
-async def capture(update, context):
-    user = str(update.effective_user.id)
-    state = USER_DATA.get(user, {}).get("state")
+    if not s: return
 
-    if not state:
-        return
+    txt=update.message.text
 
-    txt = update.message.text
-
-    if state == "vfc":
-        USER_DATA[user]["temp"]["vfc"] = int(txt)
-        USER_DATA[user]["state"] = "sleep"
+    if s=="vfc":
+        USER_DATA[u]["temp"]["vfc"]=int(txt)
+        USER_DATA[u]["state"]="sleep"
         await update.message.reply_text("Sueño hh:mm?")
         return
 
-    if state == "sleep":
-        USER_DATA[user]["temp"]["sleep"] = txt
-        USER_DATA[user]["temp"]["sleep_hours"] = hhmm_to_hours(txt)
-        USER_DATA[user]["state"] = "score"
+    if s=="sleep":
+        USER_DATA[u]["temp"]["sleep"]=hhmm_to_hours(txt)
+        USER_DATA[u]["state"]="score"
         await update.message.reply_text("Score?")
         return
 
-    if state == "score":
-        temp = USER_DATA[user]["temp"]
-        temp["score"] = int(txt)
+    if s=="score":
+        temp=USER_DATA[u]["temp"]
+        temp["score"]=int(txt)
 
-        USER_DATA.setdefault(user, {}).setdefault("metrics_by_day", {})
-        USER_DATA[user]["metrics_by_day"][temp["date"]] = temp
+        USER_DATA.setdefault(u,{}).setdefault("metrics",{})
+        USER_DATA[u]["metrics"][temp["date"]]=temp
 
-        roster = USER_DATA[user].get("roster", {})
-        today_assignment = roster.get(key_today())
-        tomorrow_assignment = roster.get(key_tomorrow())
+        r=USER_DATA[u].get("roster",{})
+        today_r=r.get(key_today())
+        tomorrow_r=r.get(key_tomorrow())
 
-        sleep_data = sleep_plan(tomorrow_assignment)
+        tr=trend(USER_DATA[u])
+        ck=extract_time(tomorrow_r["flights"][0]) if tomorrow_r and tomorrow_r["flights"] else None
 
-        payload = {
+        w=wocl(ck)
+        sc=fatigue_score(temp["vfc"],temp["sleep"],tr,w)
+
+        payload={
             **temp,
-            "trend": analyze_trend(USER_DATA[user]),
-            "today_assignment": today_assignment,
-            "tomorrow_assignment": tomorrow_assignment,
-            "sleep_plan": sleep_data,
-            "time_blocking": build_timeblock(sleep_data),
-            "frms": frms_level(temp["vfc"], temp["sleep_hours"], extract_time(tomorrow_assignment["raw"]) if tomorrow_assignment else None)
+            "trend":tr,
+            "fatigue_score":sc,
+            "fatigue_level":level(sc),
+            "wocl":w,
+            "today":today_r,
+            "tomorrow":tomorrow_r,
+            "sleep_plan":sleep_plan(tomorrow_r)
         }
 
-        text = generate_ai(payload)
+        txt=ai(payload)
 
-        USER_DATA[user]["state"] = None
+        USER_DATA[u]["state"]=None
         save()
 
-        await update.message.reply_text(text)
-
+        await update.message.reply_text(txt)
 
 # =========================
 # MAIN
@@ -293,15 +323,13 @@ async def capture(update, context):
 def main():
     load()
 
-    app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+    app=Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("plan", plan))
-    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture))
+    app.add_handler(MessageHandler(filters.Document.PDF,pdf))
+    app.add_handler(CommandHandler("plan",plan))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,capture))
 
     app.run_polling()
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
