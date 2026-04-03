@@ -5,7 +5,7 @@ import os
 import re
 import io
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -20,6 +20,7 @@ USER_DATA = {}
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
@@ -27,23 +28,15 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 # FRASES
 # =========================
 STOIC_QUOTES = [
-    "Haz hoy lo que está en tus manos.",
     "Domina la primera reacción.",
-    "La disciplina es libertad futura.",
-    "Acepta la realidad y trabaja sobre ella.",
-    "La calma también es valentía.",
-    "Tu carácter se forja en lo incómodo.",
-    "No controles el mundo, controla tu respuesta.",
+    "La disciplina es libertad.",
+    "Haz lo necesario hoy.",
 ]
 
 ECC_QUOTES = [
-    "El sabio escucha antes de hablar.",
     "La prudencia protege al hombre.",
-    "La paciencia da fruto en su tiempo.",
-    "El corazón humilde aprende con facilidad.",
-    "La palabra sabia edifica.",
-    "Quien guarda su lengua guarda su alma.",
-    "La sabiduría habita en el corazón disciplinado.",
+    "El sabio escucha antes de hablar.",
+    "La paciencia da fruto.",
 ]
 
 
@@ -82,7 +75,7 @@ def save():
 
 
 # =========================
-# ROSTER (simple)
+# ROSTER
 # =========================
 def parse_roster(text):
     data = {}
@@ -94,16 +87,31 @@ def parse_roster(text):
     return data
 
 
+def get_tomorrow_key():
+    return (now() + timedelta(days=1)).strftime("%b %d").upper()
+
+
 def find_today_assignment(roster):
-    key = datetime.now().strftime("%b").upper() + " " + datetime.now().strftime("%d")
+    key = now().strftime("%b %d").upper()
     return roster.get(key)
+
+
+def find_tomorrow_assignment(roster):
+    return roster.get(get_tomorrow_key())
+
+
+def extract_time(text):
+    if not text:
+        return None
+    m = re.search(r"(\d{2}:\d{2})", text)
+    return m.group(1) if m else None
 
 
 # =========================
 # INTELIGENCIA
 # =========================
-def analyze_trend(user_block):
-    metrics = user_block.get("metrics_by_day", {})
+def analyze_trend(user):
+    metrics = user.get("metrics_by_day", {})
     dates = sorted(metrics.keys())[-7:]
 
     if len(dates) < 3:
@@ -121,126 +129,93 @@ def analyze_trend(user_block):
     return "estable"
 
 
-def predict_tomorrow(vfc, sleep):
+def predict(vfc, sleep):
     if sleep < 5:
-        return "alto riesgo de rojo"
+        return "mañana probablemente en rojo"
     if vfc < 48:
-        return "fatiga acumulada"
+        return "fatiga acumulándose"
     return "estable"
 
 
 def detect_risk(vfc, sleep, trend):
     if sleep < 5 and vfc < 48:
-        return "riesgo alto"
+        return "alto"
     if trend == "fatiga creciente":
-        return "riesgo acumulado"
-    if sleep < 6:
-        return "riesgo moderado"
+        return "medio"
     return "bajo"
 
 
-def performance_engine(state, trend, sleep):
-    if state == "🔴":
-        return "recovery total"
-    if sleep < 6:
-        return "entrenamiento ligero"
-    if trend == "fatiga creciente":
-        return "bajar carga"
-    return "entrenamiento fuerte"
+def sleep_strategy(next_assignment):
+    if not next_assignment:
+        return None
 
+    t = extract_time(next_assignment.get("raw"))
+    if not t:
+        return None
 
-def build_profile(user_block):
-    metrics = user_block.get("metrics_by_day", {})
-    dates = sorted(metrics.keys())[-14:]
+    h, m = map(int, t.split(":"))
+    checkin = h * 60 + m
 
-    if len(dates) < 5:
-        return "sin datos"
+    wake = checkin - 120
+    sleep = wake - (7 * 60)
 
-    low_sleep = sum(1 for d in dates if metrics[d]["sleep_hours"] < 6)
-    return {"low_sleep_ratio": round(low_sleep / len(dates), 2)}
+    return {
+        "checkin": t,
+        "sleep_time": f"{sleep//60:02d}:{sleep%60:02d}",
+        "wake_time": f"{wake//60:02d}:{wake%60:02d}",
+    }
 
 
 # =========================
-# AI
+# IA (FIX IMPORTANTE)
 # =========================
 def generate_ai(payload):
     stoic, ecc = get_quotes(payload["date"])
 
-    system = """
-Eres un coach de rendimiento de élite para pilotos.
+    if not client:
+        return "❌ No hay API KEY configurada"
 
-Habla como humano.
-No checklist.
-Prioriza lo importante.
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Eres un coach de rendimiento de élite para pilotos. Habla humano, claro y útil."
+                },
+                {
+                    "role": "user",
+                    "content": f"""
+Analiza esto:
 
-Analiza:
-- estado
-- tendencia
-- riesgo
+{json.dumps(payload, indent=2)}
 
 Da:
 - interpretación clara
 - impacto real
 - decisiones clave
+- estrategia de descanso considerando mañana
 
-Cierra con frases.
-"""
-
-    user = f"""
-Analiza:
-
-{json.dumps(payload, indent=2, ensure_ascii=False)}
-
-Incluye:
+Termina con:
 🪶 {stoic}
 📖 {ecc}
 """
-
-    try:
-        res = client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                }
             ],
-            temperature=0.9,
+            temperature=0.9
         )
-        return res.output_text
-    except:
-        return f"""
-Estado: {payload['state']}
 
-Hoy prioriza recuperación.
+        return response.choices[0].message.content
 
-🪶 {stoic}
-📖 {ecc}
-"""
-
-
-def next_level():
-    return """
-
-🚀 SIGUIENTE NIVEL
-
-🧠 AI adaptativa:
-aprende tus patrones
-detecta días peligrosos
-
-📊 dashboard:
-VFC vs sueño vs fatiga
-
-🧬 performance engine:
-cuándo entrenar
-cuándo bajar carga
-cuándo hacer recovery
-"""
+    except Exception as e:
+        return f"❌ ERROR IA: {str(e)}"
 
 
 # =========================
 # TELEGRAM
 # =========================
 async def start(update, context):
-    await update.message.reply_text("Bot listo 🚀 usa /plan")
+    await update.message.reply_text("Bot listo 🚀")
 
 
 async def handle_pdf(update, context):
@@ -256,7 +231,6 @@ async def handle_pdf(update, context):
 
     USER_DATA.setdefault(user, {})
     USER_DATA[user]["roster"] = parse_roster(text)
-    USER_DATA[user]["state"] = None
 
     save()
     await update.message.reply_text("Roster cargado ✅")
@@ -267,15 +241,11 @@ async def plan(update, context):
 
     USER_DATA.setdefault(user, {})
 
-    if "roster" not in USER_DATA[user]:
-        await update.message.reply_text("Primero súbeme tu roster PDF.")
-        return
-
     USER_DATA[user]["state"] = "vfc"
     USER_DATA[user]["temp"] = {"date": today()}
 
     save()
-    await update.message.reply_text("¿Cuál es tu VFC de 7 días?")
+    await update.message.reply_text("¿VFC?")
 
 
 async def capture(update, context):
@@ -288,44 +258,33 @@ async def capture(update, context):
     txt = update.message.text.strip()
 
     if state == "vfc":
-        try:
-            USER_DATA[user]["temp"]["vfc"] = int(txt)
-        except ValueError:
-            await update.message.reply_text("Pásame solo el número de VFC. Ejemplo: 50")
-            return
-
+        USER_DATA[user]["temp"]["vfc"] = int(txt)
         USER_DATA[user]["state"] = "sleep"
-        await update.message.reply_text("¿Cuántas horas dormiste? Escríbelo en hh:mm, por ejemplo 04:05")
+        await update.message.reply_text("Sueño hh:mm?")
         save()
         return
 
     if state == "sleep":
-        if not re.fullmatch(r"\d{1,2}:\d{2}", txt):
-            await update.message.reply_text("Formato inválido. Escríbelo como hh:mm, por ejemplo 04:05")
-            return
-
         USER_DATA[user]["temp"]["sleep"] = txt
         USER_DATA[user]["temp"]["sleep_hours"] = hhmm_to_hours(txt)
         USER_DATA[user]["state"] = "score"
-        await update.message.reply_text("¿Cuál fue tu score de sueño?")
+        await update.message.reply_text("Score?")
         save()
         return
 
     if state == "score":
-        try:
-            USER_DATA[user]["temp"]["score"] = int(txt)
-        except ValueError:
-            await update.message.reply_text("Pásame solo el número del score. Ejemplo: 53")
-            return
-
         temp = USER_DATA[user]["temp"]
+        temp["score"] = int(txt)
 
         USER_DATA.setdefault(user, {}).setdefault("metrics_by_day", {})
         USER_DATA[user]["metrics_by_day"][temp["date"]] = temp
 
         trend = analyze_trend(USER_DATA[user])
-        prediction = predict_tomorrow(temp["vfc"], temp["sleep_hours"])
+        prediction = predict(temp["vfc"], temp["sleep_hours"])
         state_label = "🟢" if temp["vfc"] > 52 else "🔴" if temp["vfc"] < 49 else "🟡"
+
+        tomorrow = find_tomorrow_assignment(USER_DATA[user].get("roster", {}))
+        sleep_plan = sleep_strategy(tomorrow)
 
         payload = {
             **temp,
@@ -333,16 +292,13 @@ async def capture(update, context):
             "trend": trend,
             "prediction": prediction,
             "risk": detect_risk(temp["vfc"], temp["sleep_hours"], trend),
-            "performance": performance_engine(state_label, trend, temp["sleep_hours"]),
-            "profile": build_profile(USER_DATA[user]),
-            "assignment": find_today_assignment(USER_DATA[user].get("roster", {})),
+            "tomorrow": tomorrow,
+            "sleep_plan": sleep_plan
         }
 
         text = generate_ai(payload)
-        text += next_level()
 
         USER_DATA[user]["state"] = None
-        USER_DATA[user]["temp"] = {}
         save()
 
         await update.message.reply_text(text)
