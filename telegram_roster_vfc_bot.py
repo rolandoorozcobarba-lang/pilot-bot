@@ -719,8 +719,7 @@ IMPORTANTE:
     except Exception:
         return generate_fallback_plan(payload, quotes)
 
-
- def generate_fallback_plan(payload: Dict[str, Any], quotes: Dict[str, str]) -> str:
+def generate_fallback_plan(payload: Dict[str, Any], quotes: Dict[str, str]) -> str:
     parts = []
 
     parts.append("Resumen de hoy")
@@ -779,90 +778,6 @@ IMPORTANTE:
     parts.append(f"📖 {quotes['wisdom']}")
 
     return "\n".join(parts)
-# =========================
-# COMMANDS
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Bot listo ✅\n\n"
-        "1. Súbeme tu roster PDF\n"
-        "2. Usa /plan cada día\n"
-        "3. Yo conservaré el roster hasta que subas uno nuevo"
-    )
-
-
-async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = user_key(update)
-
-    tg_file = await context.bot.get_file(update.message.document.file_id)
-    pdf_bytes = await tg_file.download_as_bytearray()
-
-    text = extract_pdf_text(pdf_bytes)
-    parsed = parse_roster_table(text)
-    summary = roster_summary(parsed)
-
-    USER_DATA.setdefault(u, {})
-    USER_DATA[u]["roster_parsed"] = parsed
-    USER_DATA[u]["roster_summary"] = summary
-    USER_DATA[u]["conversation_state"] = None
-    USER_DATA[u].setdefault("metrics_by_day", {})
-    save_data()
-
-    heavy = summary["heavy_calendar_days"]
-    heavy_text = "\n".join([f"- {x['date']} ({x['hours']}h)" for x in heavy[:5]]) if heavy else "Ninguno"
-
-    top3 = summary["top3_calendar"]
-    top3_text = "\n".join([f"- {x['date']} ({x['hours']}h)" for x in top3]) if top3 else "Ninguno"
-
-    alerts_text = "\n".join(summary["alerts_30_in_7"]) if summary["alerts_30_in_7"] else "Sin riesgo"
-
-    visible_period = "N/D"
-    if summary["visible_start"] and summary["visible_end"]:
-        visible_period = f"{summary['visible_start']} → {summary['visible_end']}"
-
-    msg = (
-        "Roster cargado ✅\n\n"
-        f"Periodo visible: {visible_period}\n"
-        f"Horas roster (incluye pasivos): {summary['total_roster_hours']}h\n"
-        f"Horas activas: {summary['total_active_hours']}h\n"
-        f"Horas pasivas: {summary['total_passive_hours']}h\n"
-        f"Días con vuelo activo: {summary['days_with_active_flight']}\n\n"
-        f"Días pesados (>6h calendario):\n{heavy_text}\n\n"
-        f"Top 3 días con más block:\n{top3_text}\n\n"
-        f"Alertas 30h / 7 días:\n{alerts_text}"
-    )
-    await update.message.reply_text(msg)
-
-
-async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = user_key(update)
-    USER_DATA.setdefault(u, {})
-
-    if "roster_parsed" not in USER_DATA[u]:
-        await update.message.reply_text("Primero súbeme tu roster PDF.")
-        return
-
-    USER_DATA[u]["conversation_state"] = "awaiting_vfc"
-    USER_DATA[u]["pending_plan"] = {"date": today_local_str()}
-    save_data()
-
-    await update.message.reply_text("Buen día. ¿Cuál fue tu VFC de 7 días?")
-
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = user_key(update)
-    metrics = USER_DATA.get(u, {}).get("metrics_by_day", {})
-    if not metrics:
-        await update.message.reply_text("No tengo métricas guardadas todavía.")
-        return
-
-    dates = sorted(metrics.keys())[-7:]
-    lines = ["Últimas métricas:"]
-    for d in dates:
-        m = metrics[d]
-        lines.append(f"{d} → VFC {m['vfc']} | Sueño {m['sleep_hhmm']} | Score {m['score']}")
-    await update.message.reply_text("\n".join(lines))
-
 
 # =========================
 # CAPTURE FLOW
