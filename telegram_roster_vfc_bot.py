@@ -245,6 +245,7 @@ async def start(update, context):
 
 async def handle_pdf(update, context):
     user = str(update.effective_user.id)
+
     file = await context.bot.get_file(update.message.document.file_id)
     pdf = await file.download_as_bytearray()
 
@@ -255,6 +256,7 @@ async def handle_pdf(update, context):
 
     USER_DATA.setdefault(user, {})
     USER_DATA[user]["roster"] = parse_roster(text)
+    USER_DATA[user]["state"] = None
 
     save()
     await update.message.reply_text("Roster cargado ✅")
@@ -263,11 +265,17 @@ async def handle_pdf(update, context):
 async def plan(update, context):
     user = str(update.effective_user.id)
 
+    USER_DATA.setdefault(user, {})
+
+    if "roster" not in USER_DATA[user]:
+        await update.message.reply_text("Primero súbeme tu roster PDF.")
+        return
+
     USER_DATA[user]["state"] = "vfc"
     USER_DATA[user]["temp"] = {"date": today()}
 
     save()
-    await update.message.reply_text("VFC?")
+    await update.message.reply_text("¿Cuál es tu VFC de 7 días?")
 
 
 async def capture(update, context):
@@ -277,26 +285,40 @@ async def capture(update, context):
     if not state:
         return
 
-    txt = update.message.text
+    txt = update.message.text.strip()
 
     if state == "vfc":
-        USER_DATA[user]["temp"]["vfc"] = int(txt)
+        try:
+            USER_DATA[user]["temp"]["vfc"] = int(txt)
+        except ValueError:
+            await update.message.reply_text("Pásame solo el número de VFC. Ejemplo: 50")
+            return
+
         USER_DATA[user]["state"] = "sleep"
-        await update.message.reply_text("Sueño hh:mm?")
+        await update.message.reply_text("¿Cuántas horas dormiste? Escríbelo en hh:mm, por ejemplo 04:05")
         save()
         return
 
     if state == "sleep":
+        if not re.fullmatch(r"\d{1,2}:\d{2}", txt):
+            await update.message.reply_text("Formato inválido. Escríbelo como hh:mm, por ejemplo 04:05")
+            return
+
         USER_DATA[user]["temp"]["sleep"] = txt
         USER_DATA[user]["temp"]["sleep_hours"] = hhmm_to_hours(txt)
         USER_DATA[user]["state"] = "score"
-        await update.message.reply_text("Score?")
+        await update.message.reply_text("¿Cuál fue tu score de sueño?")
         save()
         return
 
     if state == "score":
+        try:
+            USER_DATA[user]["temp"]["score"] = int(txt)
+        except ValueError:
+            await update.message.reply_text("Pásame solo el número del score. Ejemplo: 53")
+            return
+
         temp = USER_DATA[user]["temp"]
-        temp["score"] = int(txt)
 
         USER_DATA.setdefault(user, {}).setdefault("metrics_by_day", {})
         USER_DATA[user]["metrics_by_day"][temp["date"]] = temp
@@ -320,6 +342,7 @@ async def capture(update, context):
         text += next_level()
 
         USER_DATA[user]["state"] = None
+        USER_DATA[user]["temp"] = {}
         save()
 
         await update.message.reply_text(text)
