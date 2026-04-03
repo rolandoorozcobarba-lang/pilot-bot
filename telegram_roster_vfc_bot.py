@@ -170,7 +170,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(DocumentHandler(filters.Document.PDF, handle_pdf))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
 
     app.run_polling()
 
