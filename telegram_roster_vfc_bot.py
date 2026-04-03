@@ -21,28 +21,7 @@ USER_DATA = {}
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-
-# =========================
-# FRASES
-# =========================
-STOIC_QUOTES = [
-    "Domina la primera reacción.",
-    "La disciplina es libertad.",
-    "Haz lo necesario hoy.",
-]
-
-ECC_QUOTES = [
-    "La prudencia protege al hombre.",
-    "El sabio escucha antes de hablar.",
-    "La paciencia da fruto.",
-]
-
-
-def get_quotes(date):
-    idx = datetime.strptime(date, "%Y-%m-%d").timetuple().tm_yday
-    return STOIC_QUOTES[idx % len(STOIC_QUOTES)], ECC_QUOTES[idx % len(ECC_QUOTES)]
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # =========================
@@ -51,14 +30,12 @@ def get_quotes(date):
 def now():
     return datetime.now(ZoneInfo("America/Mexico_City"))
 
-
 def today():
     return now().strftime("%Y-%m-%d")
 
-
 def hhmm_to_hours(h):
-    a, b = h.split(":")
-    return int(a) + int(b) / 60
+    h, m = map(int, h.split(":"))
+    return h + m/60
 
 
 # =========================
@@ -68,7 +45,6 @@ def load():
     global USER_DATA
     if os.path.exists(DATA_FILE):
         USER_DATA = json.load(open(DATA_FILE))
-
 
 def save():
     json.dump(USER_DATA, open(DATA_FILE, "w"), indent=2)
@@ -86,19 +62,11 @@ def parse_roster(text):
             data[date] = {"raw": line}
     return data
 
+def key_today():
+    return now().strftime("%b %d").upper()
 
-def get_tomorrow_key():
+def key_tomorrow():
     return (now() + timedelta(days=1)).strftime("%b %d").upper()
-
-
-def find_today_assignment(roster):
-    key = now().strftime("%b %d").upper()
-    return roster.get(key)
-
-
-def find_tomorrow_assignment(roster):
-    return roster.get(get_tomorrow_key())
-
 
 def extract_time(text):
     if not text:
@@ -108,7 +76,20 @@ def extract_time(text):
 
 
 # =========================
-# INTELIGENCIA
+# FRMS (tipo AIMS simplificado)
+# =========================
+def frms_level(vfc, sleep, checkin):
+    if sleep < 4:
+        return "🔥 CRITICAL"
+    if sleep < 5 or vfc < 47:
+        return "🔴 HIGH"
+    if sleep < 6:
+        return "🟡 MODERATE"
+    return "🟢 LOW"
+
+
+# =========================
+# FATIGA
 # =========================
 def analyze_trend(user):
     metrics = user.get("metrics_by_day", {})
@@ -123,29 +104,16 @@ def analyze_trend(user):
     if vfc[-1] < vfc[0] - 3:
         return "fatiga creciente"
 
-    if sum(sleep) / len(sleep) < 6:
+    if sum(sleep)/len(sleep) < 6:
         return "deuda de sueño"
 
     return "estable"
 
 
-def predict(vfc, sleep):
-    if sleep < 5:
-        return "mañana probablemente en rojo"
-    if vfc < 48:
-        return "fatiga acumulándose"
-    return "estable"
-
-
-def detect_risk(vfc, sleep, trend):
-    if sleep < 5 and vfc < 48:
-        return "alto"
-    if trend == "fatiga creciente":
-        return "medio"
-    return "bajo"
-
-
-def sleep_strategy(next_assignment):
+# =========================
+# SLEEP PLAN
+# =========================
+def sleep_plan(next_assignment):
     if not next_assignment:
         return None
 
@@ -157,65 +125,84 @@ def sleep_strategy(next_assignment):
     checkin = h * 60 + m
 
     wake = checkin - 120
-    sleep = wake - (7 * 60)
+    sleep = wake - (8 * 60)
 
     return {
         "checkin": t,
-        "sleep_time": f"{sleep//60:02d}:{sleep%60:02d}",
-        "wake_time": f"{wake//60:02d}:{wake%60:02d}",
+        "wake": f"{wake//60:02d}:{wake%60:02d}",
+        "sleep": f"{sleep//60:02d}:{sleep%60:02d}"
     }
 
 
 # =========================
-# IA (FIX IMPORTANTE)
+# TIME BLOCKING
+# =========================
+def build_timeblock(sleep_data):
+    if not sleep_data:
+        return "Día libre → entrena normal y duerme 7-8h"
+
+    return f"""
+Wake: {sleep_data['wake']}
+Comida 1: 60-90 min después
+Entrenamiento: ligero o movilidad
+Comida 2: media jornada
+Siesta: 20 min (si aplica)
+Cena: 3h antes de dormir
+Sleep: {sleep_data['sleep']}
+"""
+
+
+# =========================
+# IA
 # =========================
 def generate_ai(payload):
-    stoic, ecc = get_quotes(payload["date"])
 
-    if not client:
-        return "❌ No hay API KEY configurada"
+    system = """
+Eres un coach de rendimiento de élite para pilotos.
 
-    try:
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Eres un coach de rendimiento de élite para pilotos. Habla humano, claro y útil."
-                },
-                {
-                    "role": "user",
-                    "content": f"""
-Analiza esto:
+Analiza como experto en FRMS tipo AIMS.
+
+Incluye:
+1. Estado del día
+2. Impacto en desempeño
+3. Análisis de asignación (si existe)
+4. Nivel de riesgo FRMS
+5. Decisión del día (clave)
+6. Time blocking claro
+7. Estrategia de descanso para mañana
+
+No uses formato rígido.
+Habla humano, claro y directo.
+"""
+
+    user = f"""
+Analiza este contexto:
 
 {json.dumps(payload, indent=2)}
 
-Da:
-- interpretación clara
-- impacto real
-- decisiones clave
-- estrategia de descanso considerando mañana
-
-Termina con:
-🪶 {stoic}
-📖 {ecc}
+Genera un plan completo tipo coach elite.
 """
-                }
+
+    try:
+        res = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user}
             ],
             temperature=0.9
         )
-
-        return response.choices[0].message.content
+        return res.choices[0].message.content
 
     except Exception as e:
-        return f"❌ ERROR IA: {str(e)}"
+        return f"ERROR IA: {e}"
 
 
 # =========================
-# TELEGRAM
+# TELEGRAM FLOW
 # =========================
 async def start(update, context):
-    await update.message.reply_text("Bot listo 🚀")
+    await update.message.reply_text("Bot listo ✈️ usa /plan")
 
 
 async def handle_pdf(update, context):
@@ -240,12 +227,11 @@ async def plan(update, context):
     user = str(update.effective_user.id)
 
     USER_DATA.setdefault(user, {})
-
     USER_DATA[user]["state"] = "vfc"
     USER_DATA[user]["temp"] = {"date": today()}
 
     save()
-    await update.message.reply_text("¿VFC?")
+    await update.message.reply_text("VFC?")
 
 
 async def capture(update, context):
@@ -255,13 +241,12 @@ async def capture(update, context):
     if not state:
         return
 
-    txt = update.message.text.strip()
+    txt = update.message.text
 
     if state == "vfc":
         USER_DATA[user]["temp"]["vfc"] = int(txt)
         USER_DATA[user]["state"] = "sleep"
         await update.message.reply_text("Sueño hh:mm?")
-        save()
         return
 
     if state == "sleep":
@@ -269,7 +254,6 @@ async def capture(update, context):
         USER_DATA[user]["temp"]["sleep_hours"] = hhmm_to_hours(txt)
         USER_DATA[user]["state"] = "score"
         await update.message.reply_text("Score?")
-        save()
         return
 
     if state == "score":
@@ -279,21 +263,20 @@ async def capture(update, context):
         USER_DATA.setdefault(user, {}).setdefault("metrics_by_day", {})
         USER_DATA[user]["metrics_by_day"][temp["date"]] = temp
 
-        trend = analyze_trend(USER_DATA[user])
-        prediction = predict(temp["vfc"], temp["sleep_hours"])
-        state_label = "🟢" if temp["vfc"] > 52 else "🔴" if temp["vfc"] < 49 else "🟡"
+        roster = USER_DATA[user].get("roster", {})
+        today_assignment = roster.get(key_today())
+        tomorrow_assignment = roster.get(key_tomorrow())
 
-        tomorrow = find_tomorrow_assignment(USER_DATA[user].get("roster", {}))
-        sleep_plan = sleep_strategy(tomorrow)
+        sleep_data = sleep_plan(tomorrow_assignment)
 
         payload = {
             **temp,
-            "state": state_label,
-            "trend": trend,
-            "prediction": prediction,
-            "risk": detect_risk(temp["vfc"], temp["sleep_hours"], trend),
-            "tomorrow": tomorrow,
-            "sleep_plan": sleep_plan
+            "trend": analyze_trend(USER_DATA[user]),
+            "today_assignment": today_assignment,
+            "tomorrow_assignment": tomorrow_assignment,
+            "sleep_plan": sleep_data,
+            "time_blocking": build_timeblock(sleep_data),
+            "frms": frms_level(temp["vfc"], temp["sleep_hours"], extract_time(tomorrow_assignment["raw"]) if tomorrow_assignment else None)
         }
 
         text = generate_ai(payload)
